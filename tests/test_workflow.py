@@ -33,6 +33,19 @@ class FakeGateway:
         }
 
 
+class FlakyGateway(FakeGateway):
+    def __init__(self) -> None:
+        super().__init__()
+        self.failed = False
+
+    async def call(self, tool_name: str, *, case_id: str, **arguments: str) -> dict[str, Any]:
+        if tool_name == "get_policy" and not self.failed:
+            self.failed = True
+            self.calls.append({"tool": tool_name, "case_id": case_id, "args": arguments})
+            raise RuntimeError("temporary MCP failure")
+        return await super().call(tool_name, case_id=case_id, **arguments)
+
+
 class FakeTrace:
     def __init__(self) -> None:
         self.events: list[dict[str, Any]] = []
@@ -177,6 +190,15 @@ def test_collect_evidence_is_case_scoped_and_cached() -> None:
         for event in trace.events
         if event["event_type"] == "tool_result_consumed"
     }
+
+
+def test_collect_evidence_retries_one_mcp_failure() -> None:
+    gateway = FlakyGateway()
+
+    bundle = asyncio.run(collect_evidence(sample_case(), gateway, FakeTrace()))
+
+    assert bundle["evidence_refs"]
+    assert [call["tool"] for call in gateway.calls].count("get_policy") == 2
 
 
 def test_solve_case_returns_valid_l3b_output(

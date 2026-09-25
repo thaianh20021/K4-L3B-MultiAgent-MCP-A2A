@@ -117,7 +117,10 @@ async def collect_evidence(
     async def call(actor: str, tool_name: str, **arguments: str) -> dict[str, Any]:
         key = (tool_name, tuple(sorted(arguments.items())))
         if key not in cache:
-            evidence = await gateway.call(tool_name, case_id=case_id, **arguments)
+            try:
+                evidence = await gateway.call(tool_name, case_id=case_id, **arguments)
+            except RuntimeError:
+                evidence = await gateway.call(tool_name, case_id=case_id, **arguments)
             cache[key] = evidence
             records.append(
                 {
