@@ -5,13 +5,29 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from mcp.types import CallToolResult, TextContent
 
 from student_agent.contracts import Contracts
+from student_agent.mcp_gateway import EvidenceGateway
 from student_agent.trace import TraceWriter
 from student_agent.workers_ai import WorkersAISettings, parse_model_object
 from student_agent.workflow import collect_evidence, solve_case
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+class ErrorSession:
+    async def call_tool(self, tool_name: str, arguments: dict[str, str]) -> CallToolResult:
+        del tool_name, arguments
+        return CallToolResult(
+            content=[TextContent(type="text", text="not found")],
+            is_error=True,
+        )
+
+
+class NoopContracts:
+    def validate_evidence(self, value: Any, label: str) -> None:
+        del value, label
 
 
 class FakeGateway:
@@ -161,6 +177,13 @@ def test_workers_ai_settings_require_all_values(monkeypatch: pytest.MonkeyPatch)
 
     with pytest.raises(ValueError, match="CLOUDFLARE_ACCOUNT_ID"):
         WorkersAISettings.load()
+
+
+def test_gateway_uses_current_mcp_error_attribute() -> None:
+    gateway = EvidenceGateway(ErrorSession(), NoopContracts())  # type: ignore[arg-type]
+
+    with pytest.raises(RuntimeError, match="not found"):
+        asyncio.run(gateway.call("get_order", case_id="CASE_001", order_id="missing"))
 
 
 def test_parse_model_object_accepts_plain_json() -> None:
