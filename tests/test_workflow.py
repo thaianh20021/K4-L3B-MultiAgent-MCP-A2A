@@ -25,6 +25,19 @@ class ErrorSession:
         )
 
 
+class LegacyErrorSession:
+    async def call_tool(self, tool_name: str, arguments: dict[str, str]) -> Any:
+        del tool_name, arguments
+        return type(
+            "LegacyCallToolResult",
+            (),
+            {
+                "content": [TextContent(type="text", text="legacy not found")],
+                "isError": True,
+            },
+        )()
+
+
 class NoopContracts:
     def validate_evidence(self, value: Any, label: str) -> None:
         del value, label
@@ -200,6 +213,13 @@ def test_gateway_uses_current_mcp_error_attribute() -> None:
     gateway = EvidenceGateway(ErrorSession(), NoopContracts())  # type: ignore[arg-type]
 
     with pytest.raises(RuntimeError, match="not found"):
+        asyncio.run(gateway.call("get_order", case_id="CASE_001", order_id="missing"))
+
+
+def test_gateway_supports_original_mcp_error_attribute() -> None:
+    gateway = EvidenceGateway(LegacyErrorSession(), NoopContracts())  # type: ignore[arg-type]
+
+    with pytest.raises(RuntimeError, match="legacy not found"):
         asyncio.run(gateway.call("get_order", case_id="CASE_001", order_id="missing"))
 
 
