@@ -322,9 +322,81 @@ def _normalize_output(value: Any) -> Any:
         return output
     output.setdefault("data_conflicts", [])
     output.setdefault("resolution_actions", [])
+    output.setdefault(
+        "financial_resolution",
+        {"currency": "BRL", "recommended_refund_brl": 0, "refund_lines": []},
+    )
     if isinstance(output.get("assessment"), dict):
         output["assessment"].setdefault("secondary_issues", [])
     return output
+
+
+def _fallback_output(case: dict[str, Any], bundle: dict[str, Any]) -> dict[str, Any]:
+    refs = bundle["evidence_refs"]
+    resolved_order_id = bundle.get("resolved_order_id")
+    resolved_order_ids = [resolved_order_id] if resolved_order_id else []
+    candidates = list(dict.fromkeys(case.get("candidate_order_ids", [])))
+    return {
+        "schema_version": "day09-l3b-output-v2",
+        "case_id": case["case_id"],
+        "assessment": {
+            "primary_issue": "insufficient_evidence",
+            "secondary_issues": [],
+            "case_status": "needs_investigation",
+            "confidence": 0,
+        },
+        "affected_entities": {
+            "order_ids": resolved_order_ids,
+            "item_ids": [],
+            "seller_ids": [],
+            "payment_references": [],
+            "shipment_ids": [],
+        },
+        "claim_assessments": [
+            {
+                "claim_id": claim["claim_id"],
+                "verdict": "insufficient_evidence",
+                "confidence": 0,
+                "evidence_refs": refs,
+            }
+            for claim in case["customer_request"].get("claims", [])
+        ],
+        "entity_resolution": {
+            "status": "resolved" if resolved_order_id else "not_found",
+            "resolved_order_ids": resolved_order_ids,
+            "rejected_candidates": [
+                candidate for candidate in candidates if candidate != resolved_order_id
+            ],
+            "confidence": 0.5 if resolved_order_id else 0,
+        },
+        "customer_context": {
+            "customer_unique_id": case.get("customer_unique_id_hint"),
+            "related_order_ids": resolved_order_ids,
+        },
+        "shipment_analysis": {
+            "verdict": "insufficient_evidence",
+            "late_seller_ids": [],
+            "timeline_complete": False,
+        },
+        "payment_analysis": {
+            "verdict": "insufficient_evidence",
+            "captured_total_brl": None,
+            "refunded_total_brl": None,
+            "refundable_total_brl": None,
+        },
+        "root_cause_analysis": {
+            "ranked_causes": [],
+            "responsible_parties": [],
+        },
+        "evidence_refs": refs,
+        "data_conflicts": [],
+        "financial_resolution": {
+            "currency": "BRL",
+            "recommended_refund_brl": 0,
+            "refund_lines": [],
+        },
+        "resolution_actions": ["Escalate for manual investigation"],
+    }
 
 
 def _repair_prompt(prompt: str, error: Exception) -> str:
@@ -379,9 +451,17 @@ async def solve_case(
         _verify_output(output, case, allowed_refs)
         OUTPUT_CONTRACTS.validate_output(output, f"model output for {case_id}")
     except (json.JSONDecodeError, KeyError, TypeError, ValueError) as first_error:
-        output = _normalize_output(await request_object(_repair_prompt(prompt, first_error)))
-        _verify_output(output, case, allowed_refs)
-        OUTPUT_CONTRACTS.validate_output(output, f"repaired model output for {case_id}")
+        try:
+            output = _normalize_output(
+                await request_object(_repair_prompt(prompt, first_error))
+            )
+            _verify_output(output, case, allowed_refs)
+            OUTPUT_CONTRACTS.validate_output(
+                output, f"repaired model output for {case_id}"
+            )
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+            output = _fallback_output(case, bundle)
+            OUTPUT_CONTRACTS.validate_output(output, f"fallback output for {case_id}")
 
     trace.emit(
         case_id=case_id,

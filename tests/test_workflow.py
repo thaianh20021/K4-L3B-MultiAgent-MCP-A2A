@@ -349,3 +349,56 @@ def test_solve_case_adds_empty_conflicts_when_model_omits_them(
     contracts.validate_output(result, "test output")
     assert result["data_conflicts"] == []
     assert calls == 1
+
+
+def test_solve_case_adds_zero_financial_resolution_when_model_omits_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    output = sample_valid_output()
+    del output["financial_resolution"]
+
+    async def fake_request_object(prompt: str) -> dict[str, Any]:
+        del prompt
+        return output
+
+    monkeypatch.setattr("student_agent.workflow.request_object", fake_request_object)
+    contracts = Contracts(PROJECT_ROOT / "contracts" / "schemas")
+    trace = TraceWriter(tmp_path / "trace.jsonl", contracts)
+
+    result = asyncio.run(solve_case(sample_case(), FakeGateway(), trace))
+
+    contracts.validate_output(result, "test output")
+    assert result["financial_resolution"] == {
+        "currency": "BRL",
+        "recommended_refund_brl": 0,
+        "refund_lines": [],
+    }
+
+
+def test_solve_case_uses_conservative_fallback_after_two_invalid_objects(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    invalid = {**sample_valid_output(), "case_id": "WRONG_CASE"}
+    calls = 0
+
+    async def fake_request_object(prompt: str) -> dict[str, Any]:
+        nonlocal calls
+        del prompt
+        calls += 1
+        return invalid
+
+    monkeypatch.setattr("student_agent.workflow.request_object", fake_request_object)
+    contracts = Contracts(PROJECT_ROOT / "contracts" / "schemas")
+    trace = TraceWriter(tmp_path / "trace.jsonl", contracts)
+
+    result = asyncio.run(solve_case(sample_case(), FakeGateway(), trace))
+
+    contracts.validate_output(result, "test output")
+    assert calls == 2
+    assert result["assessment"] == {
+        "primary_issue": "insufficient_evidence",
+        "secondary_issues": [],
+        "case_status": "needs_investigation",
+        "confidence": 0,
+    }
+    assert result["entity_resolution"]["resolved_order_ids"] == ["order-001"]
