@@ -69,7 +69,7 @@ async def request_object(prompt: str) -> dict[str, Any]:
                     {"role": "user", "content": prompt},
                 ],
                 "temperature": 0,
-                "max_tokens": 4096,
+                "max_tokens": 8192,
             },
         )
         response.raise_for_status()
