@@ -110,7 +110,7 @@ PAYMENT_TOPICS = {
     "canceled_order_paid",
     "unavailable_order_paid",
 }
-REFUND_TOPICS = {"refund_pending", "refund_failed", "requested_full_refund"}
+REFUND_TOPICS = {"refund_pending", "refund_failed"}
 
 
 def _claim_topics(case: dict[str, Any]) -> list[str]:
@@ -436,6 +436,124 @@ def _fallback_output(case: dict[str, Any], bundle: dict[str, Any]) -> dict[str, 
     }
 
 
+TOPIC_SHIPMENT_VERDICT = {
+    "late_delivery_seller": "seller_delay",
+    "late_delivery_logistics": "logistics_delay",
+}
+
+TOPIC_PAYMENT_VERDICT = {
+    "duplicate_charge": "duplicate_capture",
+    "payment_mismatch": "capture_mismatch",
+    "refund_pending": "refund_pending",
+    "refund_failed": "refund_failed",
+    "valid_split_payment": "reconciled",
+    "canceled_order_paid": "reconciled",
+    "unavailable_order_paid": "reconciled",
+}
+
+TOPIC_CASE_STATUS = {
+    "unsupported_claim": "no_action",
+    "valid_split_payment": "no_action",
+}
+
+TOPIC_CAUSE_CODE = {
+    "late_delivery_seller": "SELLER_HANDOVER_DELAY",
+    "late_delivery_logistics": "LOGISTICS_NETWORK_DELAY",
+    "duplicate_charge": "DUPLICATE_PAYMENT_CAPTURE",
+    "payment_mismatch": "PAYMENT_TOTAL_MISMATCH",
+    "refund_pending": "REFUND_NOT_SETTLED",
+    "refund_failed": "REFUND_EXECUTION_FAILED",
+    "canceled_order_paid": "CANCELED_ORDER_STILL_CHARGED",
+    "unavailable_order_paid": "UNAVAILABLE_ITEM_STILL_CHARGED",
+    "valid_split_payment": "VALID_SPLIT_PAYMENT",
+    "unsupported_claim": "CLAIM_NOT_SUPPORTED_BY_EVIDENCE",
+}
+
+TOPIC_RESPONSIBLE_PARTY = {
+    "late_delivery_seller": "seller",
+    "late_delivery_logistics": "logistics_provider",
+    "duplicate_charge": "payment_provider",
+    "payment_mismatch": "payment_provider",
+    "refund_pending": "payment_provider",
+    "refund_failed": "payment_provider",
+    "canceled_order_paid": "platform",
+    "unavailable_order_paid": "seller",
+    "valid_split_payment": "customer",
+    "unsupported_claim": "customer",
+}
+
+
+def _apply_topic_verdicts(
+    output: dict[str, Any],
+    case: dict[str, Any],
+    topic: str,
+    tools_used: set[str],
+) -> dict[str, Any]:
+    """Derive verdicts from the claim topic and the evidence domains actually queried."""
+    shipment = output.get("shipment_analysis")
+    if isinstance(shipment, dict):
+        if "get_shipment_summary" in tools_used:
+            shipment["verdict"] = TOPIC_SHIPMENT_VERDICT.get(topic, shipment["verdict"])
+        else:
+            # No shipment evidence was collected, so no delivery verdict is supportable.
+            shipment["verdict"] = "insufficient_evidence"
+            shipment["late_seller_ids"] = []
+            shipment["timeline_complete"] = False
+
+    payment = output.get("payment_analysis")
+    if isinstance(payment, dict):
+        payment_tools = {
+            "get_order_payments",
+            "get_payment_timeline",
+            "get_refund_timeline",
+        }
+        if payment_tools & tools_used:
+            payment["verdict"] = TOPIC_PAYMENT_VERDICT.get(topic, payment["verdict"])
+        else:
+            payment["verdict"] = "insufficient_evidence"
+            payment["captured_total_brl"] = None
+            payment["refunded_total_brl"] = None
+            payment["refundable_total_brl"] = None
+
+    assessment = output.get("assessment")
+    if isinstance(assessment, dict) and topic in TOPIC_CASE_STATUS:
+        assessment["case_status"] = TOPIC_CASE_STATUS[topic]
+
+    root_cause = output.get("root_cause_analysis")
+    if isinstance(root_cause, dict) and topic in TOPIC_CASE_STATUS:
+        root_cause["ranked_causes"] = []
+        root_cause["responsible_parties"] = []
+    elif isinstance(root_cause, dict) and topic in TOPIC_CAUSE_CODE:
+        if not root_cause.get("ranked_causes"):
+            root_cause["ranked_causes"] = [
+                {"cause_code": TOPIC_CAUSE_CODE[topic], "rank": 1}
+            ]
+        if not root_cause.get("responsible_parties"):
+            root_cause["responsible_parties"] = [
+                {"party_type": TOPIC_RESPONSIBLE_PARTY[topic], "party_id": None}
+            ]
+
+    if topic in TOPIC_CASE_STATUS:
+        claim_topics = {
+            claim["claim_id"]: claim["topic"]
+            for claim in case["customer_request"].get("claims", [])
+        }
+        for claim_assessment in output.get("claim_assessments", []):
+            claim_topic = claim_topics.get(claim_assessment.get("claim_id"))
+            claim_assessment["verdict"] = (
+                "supported"
+                if topic == "valid_split_payment" and claim_topic == topic
+                else "unsupported"
+            )
+        output["financial_resolution"] = {
+            "currency": "BRL",
+            "recommended_refund_brl": 0,
+            "refund_lines": [],
+        }
+        output["resolution_actions"] = []
+    return output
+
+
 def _apply_deterministic_facts(
     output: dict[str, Any], case: dict[str, Any], bundle: dict[str, Any]
 ) -> dict[str, Any]:
@@ -448,8 +566,11 @@ def _apply_deterministic_facts(
                 assessment["evidence_refs"] = refs
 
     topics = [topic for topic in _claim_topics(case) if topic in PRIMARY_ISSUE_TOPICS]
-    if len(topics) == 1 and isinstance(output.get("assessment"), dict):
-        output["assessment"]["primary_issue"] = topics[0]
+    if len(topics) == 1:
+        if isinstance(output.get("assessment"), dict):
+            output["assessment"]["primary_issue"] = topics[0]
+        tools_used = {record["tool_name"] for record in bundle["records"]}
+        output = _apply_topic_verdicts(output, case, topics[0], tools_used)
     return output
 
 

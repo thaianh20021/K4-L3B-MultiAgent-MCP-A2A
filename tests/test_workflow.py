@@ -254,7 +254,9 @@ def test_collect_evidence_retries_one_mcp_failure() -> None:
 def test_collect_evidence_records_optional_tool_failure() -> None:
     gateway = MissingRefundGateway()
 
-    bundle = asyncio.run(collect_evidence(sample_case(), gateway, FakeTrace()))
+    bundle = asyncio.run(
+        collect_evidence(case_with_topic("refund_pending"), gateway, FakeTrace())
+    )
 
     assert bundle["failures"] == [
         {
@@ -493,3 +495,106 @@ def test_solve_case_uses_claim_topic_as_primary_issue(
 
     contracts.validate_output(result, "test output")
     assert result["assessment"]["primary_issue"] == "valid_split_payment"
+    assert result["assessment"]["case_status"] == "no_action"
+    assert result["claim_assessments"][0]["verdict"] == "supported"
+    assert result["claim_assessments"][1]["verdict"] == "unsupported"
+    assert result["root_cause_analysis"] == {
+        "ranked_causes": [],
+        "responsible_parties": [],
+    }
+    assert result["financial_resolution"] == {
+        "currency": "BRL",
+        "recommended_refund_brl": 0,
+        "refund_lines": [],
+    }
+    assert result["resolution_actions"] == []
+
+
+def test_solve_case_derives_logistics_verdict_from_topic(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    model_output = sample_valid_output()
+    model_output["shipment_analysis"]["verdict"] = "seller_delay"
+    model_output["payment_analysis"]["verdict"] = "reconciled"
+
+    async def fake_request_object(prompt: str) -> dict[str, Any]:
+        del prompt
+        return model_output
+
+    monkeypatch.setattr("student_agent.workflow.request_object", fake_request_object)
+    contracts = Contracts(PROJECT_ROOT / "contracts" / "schemas")
+    trace = TraceWriter(tmp_path / "trace.jsonl", contracts)
+
+    result = asyncio.run(
+        solve_case(case_with_topic("late_delivery_logistics"), FakeGateway(), trace)
+    )
+
+    contracts.validate_output(result, "test output")
+    assert result["shipment_analysis"]["verdict"] == "logistics_delay"
+    # No payment tool runs for a pure delivery claim, so no payment verdict is claimed.
+    assert result["payment_analysis"]["verdict"] == "insufficient_evidence"
+    assert result["payment_analysis"]["captured_total_brl"] is None
+
+
+def test_solve_case_derives_duplicate_capture_verdict(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    model_output = sample_valid_output()
+    model_output["payment_analysis"]["verdict"] = "reconciled"
+    model_output["root_cause_analysis"]["ranked_causes"] = []
+    model_output["root_cause_analysis"]["responsible_parties"] = []
+
+    async def fake_request_object(prompt: str) -> dict[str, Any]:
+        del prompt
+        return model_output
+
+    monkeypatch.setattr("student_agent.workflow.request_object", fake_request_object)
+    contracts = Contracts(PROJECT_ROOT / "contracts" / "schemas")
+    trace = TraceWriter(tmp_path / "trace.jsonl", contracts)
+
+    result = asyncio.run(
+        solve_case(case_with_topic("duplicate_charge"), FakeGateway(), trace)
+    )
+
+    contracts.validate_output(result, "test output")
+    assert result["payment_analysis"]["verdict"] == "duplicate_capture"
+    assert result["shipment_analysis"]["verdict"] == "insufficient_evidence"
+    assert result["root_cause_analysis"]["ranked_causes"][0]["cause_code"] == (
+        "DUPLICATE_PAYMENT_CAPTURE"
+    )
+    assert result["root_cause_analysis"]["responsible_parties"][0]["party_type"] == (
+        "payment_provider"
+    )
+
+
+def test_solve_case_marks_unsupported_claim_as_no_action(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    model_output = sample_valid_output()
+    model_output["assessment"]["case_status"] = "action_required"
+
+    async def fake_request_object(prompt: str) -> dict[str, Any]:
+        del prompt
+        return model_output
+
+    monkeypatch.setattr("student_agent.workflow.request_object", fake_request_object)
+    contracts = Contracts(PROJECT_ROOT / "contracts" / "schemas")
+    trace = TraceWriter(tmp_path / "trace.jsonl", contracts)
+
+    result = asyncio.run(
+        solve_case(case_with_topic("unsupported_claim"), FakeGateway(), trace)
+    )
+
+    contracts.validate_output(result, "test output")
+    assert result["assessment"]["case_status"] == "no_action"
+    assert all(
+        assessment["verdict"] == "unsupported"
+        for assessment in result["claim_assessments"]
+    )
+    assert result["root_cause_analysis"] == {
+        "ranked_causes": [],
+        "responsible_parties": [],
+    }
+    assert result["financial_resolution"]["recommended_refund_brl"] == 0
+    assert result["financial_resolution"]["refund_lines"] == []
+    assert result["resolution_actions"] == []
