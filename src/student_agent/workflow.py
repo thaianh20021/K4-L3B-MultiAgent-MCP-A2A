@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Any
 
+from .contracts import Contracts
 from .mcp_gateway import EvidenceGateway
 from .trace import TraceWriter
 from .workers_ai import request_object
+
+OUTPUT_CONTRACTS = Contracts(Path(__file__).resolve().parents[2] / "contracts" / "schemas")
 
 OUTPUT_REQUIREMENTS = """
 Return one object with exactly this top-level shape:
@@ -113,6 +117,7 @@ async def collect_evidence(
     case_id = case["case_id"]
     cache: dict[tuple[str, tuple[tuple[str, str], ...]], dict[str, Any]] = {}
     records: list[dict[str, Any]] = []
+    failures: list[dict[str, Any]] = []
 
     async def call(actor: str, tool_name: str, **arguments: str) -> dict[str, Any]:
         key = (tool_name, tuple(sorted(arguments.items())))
@@ -156,7 +161,14 @@ async def collect_evidence(
             order_evidence[order_id] = await call(
                 "entity-agent", "get_order", order_id=order_id
             )
-        except RuntimeError:
+        except RuntimeError as exc:
+            failures.append(
+                {
+                    "tool_name": "get_order",
+                    "arguments": {"order_id": order_id},
+                    "error": str(exc),
+                }
+            )
             continue
 
     claimed_order_id = case["customer_request"].get("claimed_order_id")
@@ -171,11 +183,20 @@ async def collect_evidence(
 
     customer_id = case.get("customer_unique_id_hint")
     if customer_id:
-        await call(
-            "customer-agent",
-            "get_customer_history",
-            customer_unique_id=customer_id,
-        )
+        try:
+            await call(
+                "customer-agent",
+                "get_customer_history",
+                customer_unique_id=customer_id,
+            )
+        except RuntimeError as exc:
+            failures.append(
+                {
+                    "tool_name": "get_customer_history",
+                    "arguments": {"customer_unique_id": customer_id},
+                    "error": str(exc),
+                }
+            )
     await call(
         "policy-conflict-agent",
         "get_policy",
@@ -192,12 +213,22 @@ async def collect_evidence(
             ("payment-refund-agent", "get_payment_timeline"),
             ("payment-refund-agent", "get_refund_timeline"),
         ):
-            await call(actor, tool_name, order_id=resolved_order_id)
+            try:
+                await call(actor, tool_name, order_id=resolved_order_id)
+            except RuntimeError as exc:
+                failures.append(
+                    {
+                        "tool_name": tool_name,
+                        "arguments": {"order_id": resolved_order_id},
+                        "error": str(exc),
+                    }
+                )
 
     return {
         "case_id": case_id,
         "resolved_order_id": resolved_order_id,
         "records": records,
+        "failures": failures,
         "evidence_refs": [record["evidence_ref"] for record in records],
     }
 
@@ -236,6 +267,7 @@ def _build_prompt(case: dict[str, Any], bundle: dict[str, Any]) -> str:
         ],
         "case": case,
         "mcp_evidence": bundle["records"],
+        "mcp_failures": bundle["failures"],
         "allowed_evidence_refs": bundle["evidence_refs"],
     }
     return (
@@ -271,6 +303,17 @@ def _verify_output(
         refs = assessment.get("evidence_refs")
         if not isinstance(refs, list) or not set(refs) <= allowed_refs:
             raise ValueError("claim assessment contains invalid evidence_refs")
+
+
+def _normalize_output(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {key: _normalize_output(item) for key, item in value.items()}
+    if isinstance(value, list):
+        normalized = [_normalize_output(item) for item in value]
+        if all(isinstance(item, str) for item in normalized):
+            return list(dict.fromkeys(normalized))
+        return normalized
+    return value
 
 
 def _repair_prompt(prompt: str, error: Exception) -> str:
@@ -321,11 +364,13 @@ async def solve_case(
     prompt = _build_prompt(case, bundle)
     allowed_refs = set(bundle["evidence_refs"])
     try:
-        output = await request_object(prompt)
+        output = _normalize_output(await request_object(prompt))
         _verify_output(output, case, allowed_refs)
+        OUTPUT_CONTRACTS.validate_output(output, f"model output for {case_id}")
     except (json.JSONDecodeError, KeyError, TypeError, ValueError) as first_error:
-        output = await request_object(_repair_prompt(prompt, first_error))
+        output = _normalize_output(await request_object(_repair_prompt(prompt, first_error)))
         _verify_output(output, case, allowed_refs)
+        OUTPUT_CONTRACTS.validate_output(output, f"repaired model output for {case_id}")
 
     trace.emit(
         case_id=case_id,

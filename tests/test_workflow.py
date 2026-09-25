@@ -62,6 +62,14 @@ class FlakyGateway(FakeGateway):
         return await super().call(tool_name, case_id=case_id, **arguments)
 
 
+class MissingRefundGateway(FakeGateway):
+    async def call(self, tool_name: str, *, case_id: str, **arguments: str) -> dict[str, Any]:
+        if tool_name == "get_refund_timeline":
+            self.calls.append({"tool": tool_name, "case_id": case_id, "args": arguments})
+            raise RuntimeError("refund timeline unavailable")
+        return await super().call(tool_name, case_id=case_id, **arguments)
+
+
 class FakeTrace:
     def __init__(self) -> None:
         self.events: list[dict[str, Any]] = []
@@ -190,6 +198,11 @@ def test_parse_model_object_accepts_plain_json() -> None:
     assert parse_model_object('{"case_id":"CASE_001"}') == {"case_id": "CASE_001"}
 
 
+def test_parse_model_object_accepts_mapping() -> None:
+    value = {"case_id": "CASE_001"}
+    assert parse_model_object(value) is value
+
+
 def test_parse_model_object_accepts_fenced_json() -> None:
     text = '```json\n{"case_id":"CASE_001"}\n```'
     assert parse_model_object(text) == {"case_id": "CASE_001"}
@@ -222,6 +235,21 @@ def test_collect_evidence_retries_one_mcp_failure() -> None:
 
     assert bundle["evidence_refs"]
     assert [call["tool"] for call in gateway.calls].count("get_policy") == 2
+
+
+def test_collect_evidence_records_optional_tool_failure() -> None:
+    gateway = MissingRefundGateway()
+
+    bundle = asyncio.run(collect_evidence(sample_case(), gateway, FakeTrace()))
+
+    assert bundle["failures"] == [
+        {
+            "tool_name": "get_refund_timeline",
+            "arguments": {"order_id": "order-001"},
+            "error": "refund timeline unavailable",
+        }
+    ]
+    assert [call["tool"] for call in gateway.calls].count("get_refund_timeline") == 2
 
 
 def test_solve_case_returns_valid_l3b_output(
@@ -268,3 +296,27 @@ def test_solve_case_repairs_one_invalid_model_object(
     assert result == valid
     assert len(prompts) == 2
     assert "wrong case_id" in prompts[1]
+
+
+def test_solve_case_deduplicates_scalar_arrays(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    output = sample_valid_output()
+    output["affected_entities"]["payment_references"] = ["1", "1"]
+    calls = 0
+
+    async def fake_request_object(prompt: str) -> dict[str, Any]:
+        nonlocal calls
+        del prompt
+        calls += 1
+        return output
+
+    monkeypatch.setattr("student_agent.workflow.request_object", fake_request_object)
+    contracts = Contracts(PROJECT_ROOT / "contracts" / "schemas")
+    trace = TraceWriter(tmp_path / "trace.jsonl", contracts)
+
+    result = asyncio.run(solve_case(sample_case(), FakeGateway(), trace))
+
+    contracts.validate_output(result, "test output")
+    assert result["affected_entities"]["payment_references"] == ["1"]
+    assert calls == 1

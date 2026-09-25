@@ -36,8 +36,12 @@ class WorkersAISettings:
         )
 
 
-def parse_model_object(text: str) -> dict[str, Any]:
-    cleaned = text.strip()
+def parse_model_object(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if not isinstance(value, str):
+        raise ValueError("Workers AI response must be a JSON object or string")
+    cleaned = value.strip()
     if cleaned.startswith("```"):
         cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", cleaned, flags=re.IGNORECASE)
     value = json.loads(cleaned)
@@ -70,9 +74,7 @@ async def request_object(prompt: str) -> dict[str, Any]:
     if not payload.get("success"):
         raise RuntimeError(f"Workers AI failed: {payload.get('errors', [])}")
     try:
-        text = payload["result"]["response"]
+        value = payload["result"]["response"]
     except (KeyError, TypeError) as exc:
         raise ValueError("Workers AI response has no result.response") from exc
-    if not isinstance(text, str):
-        raise ValueError("Workers AI result.response must be a string")
-    return parse_model_object(text)
+    return parse_model_object(value)
