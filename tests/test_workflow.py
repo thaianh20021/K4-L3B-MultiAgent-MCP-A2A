@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from typing import Any
 
 import pytest
 
-from student_agent.workflow import collect_evidence
+from student_agent.contracts import Contracts
+from student_agent.trace import TraceWriter
 from student_agent.workers_ai import WorkersAISettings, parse_model_object
+from student_agent.workflow import collect_evidence, solve_case
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 class FakeGateway:
@@ -60,6 +65,82 @@ def sample_case() -> dict[str, Any]:
     }
 
 
+def sample_valid_output() -> dict[str, Any]:
+    refs = [f"ev_{number:024d}" for number in range(1, 12)]
+    return {
+        "schema_version": "day09-l3b-output-v2",
+        "case_id": "L3B_CASE_001",
+        "assessment": {
+            "primary_issue": "late_delivery_logistics",
+            "secondary_issues": ["requested_full_refund"],
+            "case_status": "action_required",
+            "confidence": 0.9,
+        },
+        "affected_entities": {
+            "order_ids": ["order-001"],
+            "item_ids": [],
+            "seller_ids": [],
+            "payment_references": [],
+            "shipment_ids": [],
+        },
+        "claim_assessments": [
+            {
+                "claim_id": "claim-001-a",
+                "verdict": "supported",
+                "confidence": 0.9,
+                "evidence_refs": refs,
+            },
+            {
+                "claim_id": "claim-001-b",
+                "verdict": "supported",
+                "confidence": 0.8,
+                "evidence_refs": refs,
+            },
+        ],
+        "entity_resolution": {
+            "status": "resolved",
+            "resolved_order_ids": ["order-001"],
+            "rejected_candidates": ["candidate-001"],
+            "confidence": 0.95,
+        },
+        "customer_context": {
+            "customer_unique_id": "customer-001",
+            "related_order_ids": ["order-001"],
+        },
+        "shipment_analysis": {
+            "verdict": "logistics_delay",
+            "late_seller_ids": [],
+            "timeline_complete": True,
+        },
+        "payment_analysis": {
+            "verdict": "reconciled",
+            "captured_total_brl": 100,
+            "refunded_total_brl": 0,
+            "refundable_total_brl": 100,
+        },
+        "root_cause_analysis": {
+            "ranked_causes": [{"cause_code": "LOGISTICS_DELAY", "rank": 1}],
+            "responsible_parties": [
+                {"party_type": "logistics_provider", "party_id": None}
+            ],
+        },
+        "evidence_refs": refs,
+        "data_conflicts": [],
+        "financial_resolution": {
+            "currency": "BRL",
+            "recommended_refund_brl": 100,
+            "refund_lines": [
+                {
+                    "reason_code": "FULL_REFUND",
+                    "amount_brl": 100,
+                    "entity_id": "order-001",
+                }
+            ],
+        },
+        "resolution_actions": ["Issue the approved refund"],
+    }
+
+
 def test_workers_ai_settings_require_all_values(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("CLOUDFLARE_ACCOUNT_ID", raising=False)
     monkeypatch.setenv("CLOUDFLARE_API_TOKEN", "test-token")
@@ -96,3 +177,49 @@ def test_collect_evidence_is_case_scoped_and_cached() -> None:
         for event in trace.events
         if event["event_type"] == "tool_result_consumed"
     }
+
+
+def test_solve_case_returns_valid_l3b_output(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    expected = sample_valid_output()
+
+    async def fake_request_object(prompt: str) -> dict[str, Any]:
+        assert "entity-agent" in prompt
+        assert "shipment-agent" in prompt
+        assert "payment-refund-agent" in prompt
+        assert "policy-conflict-agent" in prompt
+        assert "verifier" in prompt
+        return expected
+
+    monkeypatch.setattr("student_agent.workflow.request_object", fake_request_object)
+    contracts = Contracts(PROJECT_ROOT / "contracts" / "schemas")
+    trace = TraceWriter(tmp_path / "trace.jsonl", contracts)
+
+    result = asyncio.run(solve_case(sample_case(), FakeGateway(), trace))
+
+    contracts.validate_output(result, "test output")
+    assert result["case_id"] == "L3B_CASE_001"
+
+
+def test_solve_case_repairs_one_invalid_model_object(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    valid = sample_valid_output()
+    invalid = {**valid, "case_id": "WRONG_CASE"}
+    responses = iter([invalid, valid])
+    prompts: list[str] = []
+
+    async def fake_request_object(prompt: str) -> dict[str, Any]:
+        prompts.append(prompt)
+        return next(responses)
+
+    monkeypatch.setattr("student_agent.workflow.request_object", fake_request_object)
+    contracts = Contracts(PROJECT_ROOT / "contracts" / "schemas")
+    trace = TraceWriter(tmp_path / "trace.jsonl", contracts)
+
+    result = asyncio.run(solve_case(sample_case(), FakeGateway(), trace))
+
+    assert result == valid
+    assert len(prompts) == 2
+    assert "wrong case_id" in prompts[1]
