@@ -102,6 +102,15 @@ def sample_case() -> dict[str, Any]:
     }
 
 
+def case_with_topic(topic: str) -> dict[str, Any]:
+    case = sample_case()
+    case["customer_request"]["claims"] = [
+        {"claim_id": "claim-001-a", "topic": topic},
+        {"claim_id": "claim-001-b", "topic": "requested_full_refund"},
+    ]
+    return case
+
+
 def sample_valid_output() -> dict[str, Any]:
     refs = [f"ev_{number:024d}" for number in range(1, 12)]
     return {
@@ -296,9 +305,14 @@ def test_solve_case_repairs_one_invalid_model_object(
     contracts = Contracts(PROJECT_ROOT / "contracts" / "schemas")
     trace = TraceWriter(tmp_path / "trace.jsonl", contracts)
 
-    result = asyncio.run(solve_case(sample_case(), FakeGateway(), trace))
+    gateway = FakeGateway()
+    result = asyncio.run(solve_case(sample_case(), gateway, trace))
 
-    assert result == valid
+    assert result["case_id"] == valid["case_id"]
+    assert result["assessment"] == valid["assessment"]
+    assert result["evidence_refs"] == [
+        f"ev_{index:024d}" for index in range(1, len(gateway.calls) + 1)
+    ]
     assert len(prompts) == 2
     assert "wrong case_id" in prompts[1]
 
@@ -402,3 +416,80 @@ def test_solve_case_uses_conservative_fallback_after_two_invalid_objects(
         "confidence": 0,
     }
     assert result["entity_resolution"]["resolved_order_ids"] == ["order-001"]
+
+
+def test_collect_evidence_skips_tools_unrelated_to_claims() -> None:
+    gateway = FakeGateway()
+
+    asyncio.run(
+        collect_evidence(case_with_topic("late_delivery_seller"), gateway, FakeTrace())
+    )
+
+    tools = [call["tool"] for call in gateway.calls]
+    assert "get_shipment_summary" in tools
+    assert "get_sellers" in tools
+    assert "get_payment_timeline" not in tools
+    assert "get_product_context" not in tools
+    assert len(gateway.calls) <= 7
+
+
+def test_collect_evidence_uses_payment_tools_for_payment_claims() -> None:
+    gateway = FakeGateway()
+
+    asyncio.run(
+        collect_evidence(case_with_topic("duplicate_charge"), gateway, FakeTrace())
+    )
+
+    tools = [call["tool"] for call in gateway.calls]
+    assert "get_order_payments" in tools
+    assert "get_payment_timeline" in tools
+    assert "get_shipment_summary" not in tools
+    assert len(gateway.calls) <= 7
+
+
+def test_solve_case_submits_every_collected_evidence_ref(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    model_output = sample_valid_output()
+    model_output["evidence_refs"] = ["ev_000000000000000000000001"]
+    for assessment in model_output["claim_assessments"]:
+        assessment["evidence_refs"] = ["ev_000000000000000000000001"]
+
+    async def fake_request_object(prompt: str) -> dict[str, Any]:
+        del prompt
+        return model_output
+
+    monkeypatch.setattr("student_agent.workflow.request_object", fake_request_object)
+    contracts = Contracts(PROJECT_ROOT / "contracts" / "schemas")
+    trace = TraceWriter(tmp_path / "trace.jsonl", contracts)
+    gateway = FakeGateway()
+
+    result = asyncio.run(solve_case(sample_case(), gateway, trace))
+
+    contracts.validate_output(result, "test output")
+    collected = [f"ev_{index:024d}" for index in range(1, len(gateway.calls) + 1)]
+    assert result["evidence_refs"] == collected
+    for assessment in result["claim_assessments"]:
+        assert assessment["evidence_refs"] == collected
+
+
+def test_solve_case_uses_claim_topic_as_primary_issue(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    model_output = sample_valid_output()
+    model_output["assessment"]["primary_issue"] = "late_delivery_seller"
+
+    async def fake_request_object(prompt: str) -> dict[str, Any]:
+        del prompt
+        return model_output
+
+    monkeypatch.setattr("student_agent.workflow.request_object", fake_request_object)
+    contracts = Contracts(PROJECT_ROOT / "contracts" / "schemas")
+    trace = TraceWriter(tmp_path / "trace.jsonl", contracts)
+
+    result = asyncio.run(
+        solve_case(case_with_topic("valid_split_payment"), FakeGateway(), trace)
+    )
+
+    contracts.validate_output(result, "test output")
+    assert result["assessment"]["primary_issue"] == "valid_split_payment"

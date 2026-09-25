@@ -89,6 +89,51 @@ primary_issue enum. Keep arrays empty when evidence does not support a value.
 Do not expose reasoning. Output JSON only.
 """.strip()
 
+PRIMARY_ISSUE_TOPICS = {
+    "canceled_order_paid",
+    "unavailable_order_paid",
+    "late_delivery_seller",
+    "late_delivery_logistics",
+    "valid_split_payment",
+    "payment_mismatch",
+    "duplicate_charge",
+    "refund_pending",
+    "refund_failed",
+    "unsupported_claim",
+}
+
+SHIPMENT_TOPICS = {"late_delivery_seller", "late_delivery_logistics"}
+PAYMENT_TOPICS = {
+    "valid_split_payment",
+    "payment_mismatch",
+    "duplicate_charge",
+    "canceled_order_paid",
+    "unavailable_order_paid",
+}
+REFUND_TOPICS = {"refund_pending", "refund_failed", "requested_full_refund"}
+
+
+def _claim_topics(case: dict[str, Any]) -> list[str]:
+    return [claim.get("topic", "") for claim in case["customer_request"].get("claims", [])]
+
+
+def _order_tool_plan(topics: list[str]) -> list[tuple[str, str]]:
+    """Pick order-scoped tools by claim topic to keep MCP calls inside budget."""
+    topic_set = set(topics)
+    plan: list[tuple[str, str]] = []
+    if topic_set & SHIPMENT_TOPICS:
+        plan.append(("shipment-agent", "get_shipment_summary"))
+        plan.append(("order-product-agent", "get_sellers"))
+    if topic_set & PAYMENT_TOPICS:
+        plan.append(("payment-refund-agent", "get_order_payments"))
+        plan.append(("payment-refund-agent", "get_payment_timeline"))
+    if topic_set & REFUND_TOPICS:
+        plan.append(("payment-refund-agent", "get_refund_timeline"))
+    if not plan or "unsupported_claim" in topic_set:
+        plan.append(("order-product-agent", "get_order_items"))
+    return list(dict.fromkeys(plan))
+
+
 AGENTS = (
     "entity-agent",
     "customer-agent",
@@ -204,15 +249,7 @@ async def collect_evidence(
     )
 
     if resolved_order_id:
-        for actor, tool_name in (
-            ("order-product-agent", "get_order_items"),
-            ("order-product-agent", "get_product_context"),
-            ("order-product-agent", "get_sellers"),
-            ("shipment-agent", "get_shipment_summary"),
-            ("payment-refund-agent", "get_order_payments"),
-            ("payment-refund-agent", "get_payment_timeline"),
-            ("payment-refund-agent", "get_refund_timeline"),
-        ):
+        for actor, tool_name in _order_tool_plan(_claim_topics(case)):
             try:
                 await call(actor, tool_name, order_id=resolved_order_id)
             except RuntimeError as exc:
@@ -399,6 +436,23 @@ def _fallback_output(case: dict[str, Any], bundle: dict[str, Any]) -> dict[str, 
     }
 
 
+def _apply_deterministic_facts(
+    output: dict[str, Any], case: dict[str, Any], bundle: dict[str, Any]
+) -> dict[str, Any]:
+    """Pin evidence and primary issue to audited facts instead of model choice."""
+    refs = list(bundle["evidence_refs"])
+    if refs:
+        output["evidence_refs"] = refs
+        for assessment in output.get("claim_assessments", []):
+            if isinstance(assessment, dict):
+                assessment["evidence_refs"] = refs
+
+    topics = [topic for topic in _claim_topics(case) if topic in PRIMARY_ISSUE_TOPICS]
+    if len(topics) == 1 and isinstance(output.get("assessment"), dict):
+        output["assessment"]["primary_issue"] = topics[0]
+    return output
+
+
 def _repair_prompt(prompt: str, error: Exception) -> str:
     return (
         f"{prompt}\n\n"
@@ -448,6 +502,7 @@ async def solve_case(
     allowed_refs = set(bundle["evidence_refs"])
     try:
         output = _normalize_output(await request_object(prompt))
+        output = _apply_deterministic_facts(output, case, bundle)
         _verify_output(output, case, allowed_refs)
         OUTPUT_CONTRACTS.validate_output(output, f"model output for {case_id}")
     except (json.JSONDecodeError, KeyError, TypeError, ValueError) as first_error:
@@ -455,6 +510,7 @@ async def solve_case(
             output = _normalize_output(
                 await request_object(_repair_prompt(prompt, first_error))
             )
+            output = _apply_deterministic_facts(output, case, bundle)
             _verify_output(output, case, allowed_refs)
             OUTPUT_CONTRACTS.validate_output(
                 output, f"repaired model output for {case_id}"
