@@ -305,15 +305,26 @@ def _verify_output(
             raise ValueError("claim assessment contains invalid evidence_refs")
 
 
-def _normalize_output(value: Any) -> Any:
+def _normalize_value(value: Any) -> Any:
     if isinstance(value, dict):
-        return {key: _normalize_output(item) for key, item in value.items()}
+        return {key: _normalize_value(item) for key, item in value.items()}
     if isinstance(value, list):
-        normalized = [_normalize_output(item) for item in value]
+        normalized = [_normalize_value(item) for item in value]
         if all(isinstance(item, str) for item in normalized):
             return list(dict.fromkeys(normalized))
         return normalized
     return value
+
+
+def _normalize_output(value: Any) -> Any:
+    output = _normalize_value(value)
+    if not isinstance(output, dict):
+        return output
+    output.setdefault("data_conflicts", [])
+    output.setdefault("resolution_actions", [])
+    if isinstance(output.get("assessment"), dict):
+        output["assessment"].setdefault("secondary_issues", [])
+    return output
 
 
 def _repair_prompt(prompt: str, error: Exception) -> str:

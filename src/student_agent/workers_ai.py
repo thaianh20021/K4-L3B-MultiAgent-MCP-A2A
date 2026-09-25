@@ -44,10 +44,13 @@ def parse_model_object(value: Any) -> dict[str, Any]:
     cleaned = value.strip()
     if cleaned.startswith("```"):
         cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", cleaned, flags=re.IGNORECASE)
-    value = json.loads(cleaned)
-    if not isinstance(value, dict):
+    start = cleaned.find("{")
+    if start < 0:
+        raise ValueError("Workers AI response contains no JSON object")
+    parsed, _ = json.JSONDecoder().raw_decode(cleaned[start:])
+    if not isinstance(parsed, dict):
         raise ValueError("Workers AI response must be a JSON object")
-    return value
+    return parsed
 
 
 async def request_object(prompt: str) -> dict[str, Any]:

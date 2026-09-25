@@ -208,6 +208,11 @@ def test_parse_model_object_accepts_fenced_json() -> None:
     assert parse_model_object(text) == {"case_id": "CASE_001"}
 
 
+def test_parse_model_object_ignores_trailing_commentary() -> None:
+    text = '{"case_id":"CASE_001"}\nThis is the final answer.'
+    assert parse_model_object(text) == {"case_id": "CASE_001"}
+
+
 def test_collect_evidence_is_case_scoped_and_cached() -> None:
     gateway = FakeGateway()
     trace = FakeTrace()
@@ -319,4 +324,28 @@ def test_solve_case_deduplicates_scalar_arrays(
 
     contracts.validate_output(result, "test output")
     assert result["affected_entities"]["payment_references"] == ["1"]
+    assert calls == 1
+
+
+def test_solve_case_adds_empty_conflicts_when_model_omits_them(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    output = sample_valid_output()
+    del output["data_conflicts"]
+    calls = 0
+
+    async def fake_request_object(prompt: str) -> dict[str, Any]:
+        nonlocal calls
+        del prompt
+        calls += 1
+        return output
+
+    monkeypatch.setattr("student_agent.workflow.request_object", fake_request_object)
+    contracts = Contracts(PROJECT_ROOT / "contracts" / "schemas")
+    trace = TraceWriter(tmp_path / "trace.jsonl", contracts)
+
+    result = asyncio.run(solve_case(sample_case(), FakeGateway(), trace))
+
+    contracts.validate_output(result, "test output")
+    assert result["data_conflicts"] == []
     assert calls == 1
