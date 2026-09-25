@@ -43,7 +43,9 @@ The prompt instructs the model to use only supplied evidence and return a single
 JSON object. No prompts or hidden reasoning are written to trace.
 
 If the model response is malformed, Python performs one repair request. If the
-response remains invalid, the run fails visibly rather than inventing evidence.
+response remains invalid, Python emits a schema-valid `insufficient_evidence`
+assessment using only the case-scoped order and evidence references already
+returned by MCP.
 
 ## Trace
 

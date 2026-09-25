@@ -289,7 +289,9 @@ except (json.JSONDecodeError, KeyError, TypeError, ValueError) as first_error:
     verify_output(output, case, allowed_refs)
 ```
 
-Do not retry authentication, quota, or transport failures.
+Do not retry authentication, quota, or transport failures. If both model
+objects fail local/schema validation, return a conservative
+`insufficient_evidence` output using only current-case MCP references.
 
 - [ ] **Step 5: Run workflow tests and the full unit suite**
 

@@ -62,7 +62,7 @@ resolution code. Cache bị hủy khi `solve_case()` kết thúc nên evidence k
 | MCP runtime failure | 1 | Ghi specialist evidence unavailable; policy failure vẫn dừng case | Không consume evidence lỗi |
 | Entity not found/ambiguous | 0 | Model trả `not_found` hoặc `ambiguous` | `handoff/EVIDENCE_READY` |
 | Source conflict | 0 | Giữ conflict và giảm confidence | `policy_decided/POLICY_APPLIED` |
-| Invalid model result | 1 repair | Thất bại rõ ràng sau repair | Không finalize output lỗi |
+| Invalid model result | 1 repair | Output bảo thủ `insufficient_evidence` sau repair lỗi | `verification_completed/OUTPUT_VERIFIED` |
 
 Cache key là `(tool_name, sorted arguments)` trong một case. Workflow chỉ gọi
 hai candidate đã cung cấp và các tool theo investigation scope; không quét dữ
