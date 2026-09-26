@@ -10,6 +10,7 @@ from typing import Any
 from . import OUTPUT_SCHEMA_VERSION, VARIANT_ID
 from .cases import CaseSet
 from .contracts import Contracts
+from .verification import verify_output
 
 SECRET_PATTERN = re.compile(r"sk-team-[A-Za-z0-9_-]{8,}")
 MAX_FILE_BYTES = 1024 * 1024
@@ -65,6 +66,8 @@ def validate_artifacts(
         raise ValueError("traces/trace.jsonl is missing or not UTF-8") from exc
     normalized_lines: list[str] = []
     seen_events: set[str] = set()
+    events_by_case: dict[str, list[dict]] = {case_id: [] for case_id in expected}
+    ref_owners: dict[str, str] = {}
     for number, line in enumerate(trace_lines, 1):
         if not line.strip():
             continue
@@ -78,7 +81,39 @@ def validate_artifacts(
         if event["event_id"] in seen_events:
             raise ValueError(f"traces/trace.jsonl:{number}: duplicate event_id")
         seen_events.add(event["event_id"])
+        events_by_case[event["case_id"]].append(event)
+        for ref in event.get("evidence_refs", []):
+            owner = ref_owners.setdefault(ref, event["case_id"])
+            if owner != event["case_id"]:
+                raise ValueError("trace reuses an evidence_ref across cases")
         normalized_lines.append(json.dumps(event, ensure_ascii=False, separators=(",", ":")))
+
+    required = {
+        "case_received",
+        "task_assigned",
+        "handoff",
+        "verification_completed",
+        "case_finalized",
+    }
+    for case_id, events in events_by_case.items():
+        types = [event["event_type"] for event in events]
+        if not required <= set(types):
+            raise ValueError(f"{case_id}: incomplete trace lifecycle")
+        if (
+            types[0] != "case_received"
+            or types[-1] != "case_finalized"
+            or types.count("case_received") != 1
+            or types.count("case_finalized") != 1
+            or types.index("verification_completed") >= len(types) - 1
+        ):
+            raise ValueError(f"{case_id}: invalid trace lifecycle ordering")
+        consumed = {
+            ref
+            for event in events
+            if event["event_type"] == "tool_result_consumed"
+            for ref in event.get("evidence_refs", [])
+        }
+        verify_output(outputs[case_id], case_set.cases[case_id], consumed)
 
     serialized = [json.dumps(value, ensure_ascii=False) for value in outputs.values()]
     if SECRET_PATTERN.search("\n".join([*serialized, *normalized_lines])):

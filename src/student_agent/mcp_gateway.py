@@ -3,11 +3,14 @@ from __future__ import annotations
 import json
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from copy import deepcopy
 from typing import Any
 
 import httpx2
+from jsonschema import Draft202012Validator
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
+from mcp.types import PaginatedRequestParams
 
 from .contracts import Contracts
 
@@ -16,15 +19,40 @@ class EvidenceGateway:
     def __init__(self, session: ClientSession, contracts: Contracts) -> None:
         self._session = session
         self._contracts = contracts
+        self._tools: dict[str, dict[str, Any]] | None = None
+        self._owners: dict[str, str] = {}
+
+    async def discover_tools(self) -> dict[str, dict[str, Any]]:
+        if self._tools is None:
+            tools = {}
+            cursor = None
+            while True:
+                params = PaginatedRequestParams(cursor=cursor) if cursor else None
+                response = await self._session.list_tools(params=params)
+                for tool in response.tools:
+                    schema = getattr(tool, "input_schema", None)
+                    if schema is None:
+                        schema = getattr(tool, "inputSchema", {})
+                    tools[tool.name] = schema
+                cursor = getattr(response, "next_cursor", None) or getattr(
+                    response, "nextCursor", None
+                )
+                if not cursor:
+                    break
+            self._tools = tools
+        return deepcopy(self._tools)
 
     async def list_tools(self) -> list[str]:
-        response = await self._session.list_tools()
-        return sorted(tool.name for tool in response.tools)
+        return sorted(await self.discover_tools())
 
-    async def call(self, tool_name: str, *, case_id: str, **arguments: str) -> dict[str, Any]:
+    async def call(self, tool_name: str, *, case_id: str, **arguments: Any) -> dict[str, Any]:
+        tools = await self.discover_tools()
+        if tool_name not in tools:
+            raise ValueError(f"MCP tool was not discovered: {tool_name}")
         payload = {"case_id": case_id, **arguments}
+        Draft202012Validator(tools[tool_name]).validate(payload)
         result = await self._session.call_tool(tool_name, arguments=payload)
-        if result.isError:
+        if getattr(result, "is_error", getattr(result, "isError", False)):
             message = " ".join(
                 block.text for block in result.content if getattr(block, "text", None)
             )
@@ -38,6 +66,9 @@ class EvidenceGateway:
                 raise ValueError(f"MCP tool {tool_name} did not return one evidence object")
             evidence = json.loads(text_blocks[0])
         self._contracts.validate_evidence(evidence, f"MCP tool {tool_name}")
+        owner = self._owners.setdefault(evidence["evidence_ref"], case_id)
+        if owner != case_id:
+            raise ValueError("MCP returned an evidence_ref already owned by another case")
         return evidence
 
 
